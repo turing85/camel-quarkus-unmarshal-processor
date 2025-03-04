@@ -1,0 +1,226 @@
+= quarkus-camel-unmarshal-processor
+
+This project shows a change in behaviour between quarkus-camel version `3.18.4` (camel `4.9.0`) and `3.19.1` (camel `4.10.0`).
+
+== Setup
+
+The project provides a single custom processor, link:src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java[`MyUnmarshalProcessor.java`]:
+[source,java]
+----
+public class MyUnmarshalProcessor implements Processor {
+  @Override
+  public void process(Exchange exchange) throws Exception {
+    exchange.setProperty(Exchange.CONTENT_TYPE, "text/plain");
+
+    unmarshal(exchange);
+//    exchange.setIn(exchange.getOut());
+    AttachmentMessage msg = exchange.getIn(AttachmentMessage.class);
+    for (Map.Entry<String, DataHandler> attachment : msg.getAttachments().entrySet()) {
+      exchange.setProperty(attachment.getKey(), attachment.getValue().getContent());
+    }
+  }
+
+  private void unmarshal(Exchange exchange) throws Exception {
+    try (MimeMultipartDataFormat dataFormat = new MimeMultipartDataFormat()) {
+      new UnmarshalProcessor(dataFormat).process(exchange);
+    }
+  }
+}
+----
+
+We test the behaviour with link:src/test/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessorTest.java[`MyUnmarshalProcessorTest.java`]:
+
+[source,java]
+----
+class MyUnmarshalProcessorTest extends CamelTestSupport {
+  @Test
+  void test() throws Exception {
+    // GIVEN
+    String expectedMessage = "Hello, world!";
+    String body = """
+        ------=_divider
+        Content-Type: text/plain; charset=ISO-8859-15
+        Content-Transfer-Encoding: 8bit
+
+        %s
+        ------=_divider
+        Content-Type: application/octet-stream
+        Content-Transfer-Encoding: base64
+        Content-Disposition: attachment; filename=JMS_Normalized_Message_Properties
+        Content-ID: JMS_Normalized_Message_Properties
+
+        SGVsbG8sIHdvcmxkCg==
+        ------=_divider--
+        """.formatted(expectedMessage);
+    Exchange exchange = ExchangeBuilder.anExchange(context())
+        .withHeader(Exchange.CONTENT_TYPE,
+            "multipart/related; type=\"text/plain\";boundary=\"----=_divider\"")
+        .withBody(body).build();
+
+    // when
+    new MyUnmarshalProcessor().process(exchange);
+
+    // then
+    String actualMessage = exchange.getMessage().getBody(String.class);
+    System.out.println(actualMessage);
+    Truth.assertThat(actualMessage).isEqualTo(expectedMessage);
+  }
+}
+----
+
+== Running with quarkus `3.18.4`
+The application is configured to run with quarkus `3.18.4` (camel `4.9.0`). When we run the tests, they succeed:
+
+.Running the tests wiht quarkus `3.18.4`
+[source,bash]
+----
+$ ./mvnw clean test
+...
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.250 s -- in de.turing85.quarkus.camel.unmarshal.processor.MyUnmarshalProcessorTest
+[INFO]
+[INFO] Results:
+[INFO]
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+...
+----
+
+== Running with quarkus `3.19.1`
+If we apply the following patch to change to quarkus `3.19.1` (camel `4.10.0`):
+
+.Patch to change to quarkus `3.19.1`
+[source,diff]
+----
+Subject: [PATCH] Change to quarkus 3.19.1
+---
+Index: pom.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/pom.xml b/pom.xml
+--- a/pom.xml	(revision 5716ae9e4cef2b696a1268cc3f785286e73e3c1e)
++++ b/pom.xml	(date 1741104327754)
+@@ -35,7 +35,7 @@
+         <!-- Quarkus versions -->
+         <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+-        <quarkus.platform.version>3.18.4</quarkus.platform.version>
++        <quarkus.platform.version>3.19.1</quarkus.platform.version>
+
+         <!-- Camel Quarkus -->
+         <camel-quarkus-platform.group-id>io.quarkus.platform</camel-quarkus-platform.group-id>
+----
+
+And rerun the tests, we see that the tests fails:
+
+.Running the tests with quarkus `3.19.1`
+[source,bash]
+----
+$ ./mvnw clean test
+...
+[ERROR] Failures:
+[ERROR]   MyUnmarshalProcessorTest.test:41 expected:
+    Hello, world!
+but was:
+    ------=_divider
+    Content-Type: text/plain; charset=ISO-8859-15
+    Content-Transfer-Encoding: 8bit
+
+    Hello, world!
+    ------=_divider
+    Content-Type: application/octet-stream
+    Content-Transfer-Encoding: base64
+    Content-Disposition: attachment; filename=JMS_Normalized_Message_Properties
+    Content-ID: JMS_Normalized_Message_Properties
+
+    SGVsbG8sIHdvcmxkCg==
+    ------=_divider--
+
+[INFO]
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+...
+----
+
+== Workaround for quarkus `3.19.1`
+When we debug the tests, we can see that the `exchange.getMessage().getBody(String.class)` is still the expected value before `AttachmentMessage msg = exchange.getIn(AttachmentMessage.class);` is executed. If we run `exchange.setIn(exchange.getOut());` before calling `AttachmentMessage msg = exchange.getIn(AttachmentMessage.class)`, then we can work around the issue. Here is a patch to realize this change:
+
+.Patch to change to quarkus `3.19.1` and cicrumvent the issue
+[source,diff]
+----
+Subject: [PATCH] Change to quarkus 3.19.1, prevent the issue
+---
+Index: src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java b/src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java
+--- a/src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java	(revision af1ac2437160d83609923a1c76f498dc72eb73fb)
++++ b/src/main/java/de/turing85/quarkus/camel/unmarshal/processor/MyUnmarshalProcessor.java	(date 1741104613664)
+@@ -16,7 +16,7 @@
+     exchange.setProperty(Exchange.CONTENT_TYPE, "text/plain");
+
+     unmarshal(exchange);
+-    // exchange.setIn(exchange.getOut());
++    exchange.setIn(exchange.getOut());
+     AttachmentMessage msg = exchange.getIn(AttachmentMessage.class);
+     for (Map.Entry<String, DataHandler> attachment : msg.getAttachments().entrySet()) {
+       exchange.setProperty(attachment.getKey(), attachment.getValue().getContent());
+Index: pom.xml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/pom.xml b/pom.xml
+--- a/pom.xml	(revision af1ac2437160d83609923a1c76f498dc72eb73fb)
++++ b/pom.xml	(date 1741104609285)
+@@ -35,7 +35,7 @@
+         <!-- Quarkus versions -->
+         <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+-        <quarkus.platform.version>3.18.4</quarkus.platform.version>
++        <quarkus.platform.version>3.19.1</quarkus.platform.version>
+
+         <!-- Camel Quarkus -->
+         <camel-quarkus-platform.group-id>io.quarkus.platform</camel-quarkus-platform.group-id>
+----
+
+And here is the corresponding test execution:
+
+.Running the tests with quarkus `3.19.1` and the workaround
+[source,bash]
+----
+./mvnw clean test
+...
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.262 s -- in de.turing85.quarkus.camel.unmarshal.processor.MyUnmarshalProcessorTest
+[INFO]
+[INFO] Results:
+[INFO]
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+...
+----
+
+
+== Contributors ✨
+
+Thanks goes to these wonderful people (https://allcontributors.org/docs/en/emoji-key[emoji key]):
+
+++++
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://turing85.github.io"><img src="https://avatars.githubusercontent.com/u/32584495?v=4?s=100" width="100px;" alt="Marco Bungart"/><br /><sub><b>Marco Bungart</b></sub></a><br /><a href="#code-turing85" title="Code">💻</a> <a href="#maintenance-turing85" title="Maintenance">🚧</a> <a href="#doc-turing85" title="Documentation">📖</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+++++
+
+This project follows the https://github.com/all-contributors/all-contributors[all-contributors] specification. Contributions of any kind welcome!
